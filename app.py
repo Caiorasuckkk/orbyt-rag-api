@@ -14,17 +14,17 @@ from orbyt_rag import (
 # ---------------------------------------
 app = FastAPI(title="Orbyt RAG API", version="1.0.0")
 
-# Libere a origem do seu app (ou "*", durante o MVP)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # coloque o domínio/URL do seu app em produção
+    allow_origins=["*"],   
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Cache opcional em memória (melhora latência após indexar)
-retrievers_cache = {}  # chave: (user_id, collection_id) -> retriever
+
+retrievers_cache = {}  
 
 # ---------------------------------------
 # Schemas (Pydantic)
@@ -82,7 +82,6 @@ def ask(user_id: str, collection_id: str, payload: AskPayload):
     except Exception:
         raise HTTPException(status_code=404, detail="Coleção não encontrada. Faça o index primeiro.")
 
-    # Se veio prompt customizado, usamos ele; senão usamos o padrão interno
     if payload.prompt_template:
         chain = create_rag_chain(retriever, prompt_template=payload.prompt_template)
         answer = chain.invoke(payload.question)

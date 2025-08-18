@@ -38,7 +38,7 @@ if not COHERE_API_KEY:
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 3000))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 200))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
-VECTOR_DIR = os.environ.get("VECTOR_DIR", "orbyt_vector_db")  # para Chroma persistido em disco
+VECTOR_DIR = os.environ.get("VECTOR_DIR", "orbyt_vector_db")
 RETRIEVER_K = int(os.environ.get("RETRIEVER_K", 10))
 RERANK_TOP_N = int(os.environ.get("RERANK_TOP_N", 3))
 
@@ -56,7 +56,7 @@ embeddings_model = OpenAIEmbeddings(
 llm = ChatOpenAI(
     model_name=OPENAI_MODEL,
     max_tokens=800,
-    temperature=0.2,  # respostas mais focadas (estudo)
+    temperature=0.2,  # respostas mais focadas 
     api_key=OPENAI_API_KEY
 )
 
