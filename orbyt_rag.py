@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain_cohere import CohereRerank, CohereEmbeddings
@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 
 # -------------------------------------------------------------------
-# Variáveis de ambiente (NÃO hardcode chaves!)
+# Variáveis de ambiente
 # -------------------------------------------------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
@@ -38,8 +38,8 @@ if not OPENAI_API_KEY:
 if not COHERE_API_KEY:
     raise ValueError("Defina a variável de ambiente COHERE_API_KEY")
 
-# Configs ajustáveis por ambiente
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1500))   # equilibrado p/ 512MB RAM
+# Configs ajustáveis
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1500))   # bom p/ instância 512MB
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 100))
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 VECTOR_DIR = os.environ.get("VECTOR_DIR", "orbyt_vector_db")
@@ -50,8 +50,8 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
 # Modelos
-#  - Embeddings: Cohere (evita /v1/embeddings da OpenAI que está dando 520)
-#  - LLM: OpenAI (permanece igual)
+#   - Embeddings: Cohere (foge do /v1/embeddings da OpenAI que estava 520)
+#   - LLM: OpenAI, com retry/timeout
 # -------------------------------------------------------------------
 embeddings_model = CohereEmbeddings(
     model="embed-multilingual-v3.0",
@@ -62,7 +62,9 @@ llm = ChatOpenAI(
     model_name=OPENAI_MODEL,
     max_tokens=800,
     temperature=0.2,
-    api_key=OPENAI_API_KEY
+    api_key=OPENAI_API_KEY,
+    max_retries=5,     # tenta de novo em caso de 5xx
+    timeout=60         # evita travar
 )
 
 # -------------------------------------------------------------------
@@ -141,7 +143,7 @@ Contexto:
 """
 
 # -------------------------------------------------------------------
-# Utils coleção
+# Helpers
 # -------------------------------------------------------------------
 def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DIR) -> str:
     path = os.path.join(base_dir, f"user_{user_id}", f"collection_{collection_id}")
@@ -168,6 +170,18 @@ def _build_splitter() -> RecursiveCharacterTextSplitter:
         length_function=len,
         add_start_index=True
     )
+
+def _combine_docs(docs) -> str:
+    """Transforma lista de Document em texto legível no prompt."""
+    if not docs:
+        return "NENHUM TRECHO ENCONTRADO."
+    parts = []
+    for i, d in enumerate(docs[:8]):  # limita contexto bruto no prompt
+        txt = (d.page_content or "").strip()
+        if not txt:
+            continue
+        parts.append(f"Trecho {i+1}:\n{txt}")
+    return "\n\n".join(parts) if parts else "NENHUM TRECHO ENCONTRADO."
 
 def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetriever:
     retriever = vectordb.as_retriever(search_kwargs={"k": RETRIEVER_K})
@@ -225,7 +239,7 @@ def delete_collection(user_id: str, collection_id: str) -> None:
         logging.info(f"Coleção {collection_id} deletada")
 
 # -------------------------------------------------------------------
-# Chains RAG
+# Chain RAG
 # -------------------------------------------------------------------
 def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, prompt_template: Optional[str] = None):
     template = prompt_template or TUTOR_TEMPLATE
@@ -233,7 +247,7 @@ def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, promp
 
     setup_retrieval = RunnableParallel({
         "question": RunnablePassthrough(),
-        "context": compressor_retriever
+        "context": compressor_retriever | RunnableLambda(_combine_docs)
     })
     output_parser = StrOutputParser()
     return setup_retrieval | prompt | llm | output_parser
@@ -242,38 +256,22 @@ def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, promp
 # Funcionalidades
 # -------------------------------------------------------------------
 def ask_question(retriever: ContextualCompressionRetriever, question: str) -> str:
-    try:
-        chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
-        return chain.invoke(question)
-    except Exception as e:
-        logging.exception(f"Erro em ask_question: {e}")
-        raise
+    chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
+    return chain.invoke(question)
 
 def generate_flashcards(retriever: ContextualCompressionRetriever, objective: str, n_cards: int = 10) -> str:
-    try:
-        tmpl = FLASHCARDS_TEMPLATE.replace("{n_cards}", str(n_cards))
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_flashcards: {e}")
-        raise
+    tmpl = FLASHCARDS_TEMPLATE.replace("{n_cards}", str(n_cards))
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
 
 def generate_exercises(retriever: ContextualCompressionRetriever, objective: str, n_questions: int = 6, difficulty: str = "médio") -> str:
-    try:
-        tmpl = EXERCISES_TEMPLATE.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_exercises: {e}")
-        raise
+    tmpl = EXERCISES_TEMPLATE.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
 
 def generate_study_plan(retriever: ContextualCompressionRetriever, objective: str, days: int = 7, minutes_per_day: int = 60) -> str:
-    try:
-        tmpl = (STUDY_PLAN_TEMPLATE
-                .replace("{days}", str(days))
-                .replace("{minutes_per_day}", str(minutes_per_day)))
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_study_plan: {e}")
-        raise
+    tmpl = (STUDY_PLAN_TEMPLATE
+            .replace("{days}", str(days))
+            .replace("{minutes_per_day}", str(minutes_per_day)))
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
