@@ -4,6 +4,9 @@
 import os, sys, logging, shutil, tempfile, requests
 from typing import List, Optional
 
+# Desativa ruído de telemetria do Chroma
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import Chroma
@@ -12,7 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_cohere import CohereRerank, CohereEmbeddings
+from langchain_cohere import CohereRerank, CohereEmbeddings, ChatCohere
 
 # -------------------------------------------------------------------
 # Encoding e logging
@@ -22,10 +25,7 @@ try:
 except Exception:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------------------------------------------------------
 # Variáveis de ambiente
@@ -38,34 +38,53 @@ if not OPENAI_API_KEY:
 if not COHERE_API_KEY:
     raise ValueError("Defina a variável de ambiente COHERE_API_KEY")
 
-# Configs ajustáveis
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1500))   # bom p/ instância 512MB
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1500))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 100))
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo-0125")
 VECTOR_DIR = os.environ.get("VECTOR_DIR", "orbyt_vector_db")
 RETRIEVER_K = int(os.environ.get("RETRIEVER_K", 8))
 RERANK_TOP_N = int(os.environ.get("RERANK_TOP_N", 3))
+
+# Controle de contexto enviado ao LLM
+MAX_DOCS_IN_PROMPT = int(os.environ.get("MAX_DOCS_IN_PROMPT", 4))
+MAX_CONTEXT_CHARS   = int(os.environ.get("MAX_CONTEXT_CHARS", 3000))
+
+# Preferência de LLM e modelo Cohere
+LLM_PRIMARY = os.environ.get("LLM_PRIMARY", "openai").lower()   # "openai" ou "cohere"
+COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-r")
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
 # Modelos
-#   - Embeddings: Cohere (foge do /v1/embeddings da OpenAI que estava 520)
-#   - LLM: OpenAI, com retry/timeout
+#   - Embeddings em Cohere (estáveis)
+#   - LLM primário + fallback
 # -------------------------------------------------------------------
 embeddings_model = CohereEmbeddings(
     model="embed-multilingual-v3.0",
     cohere_api_key=COHERE_API_KEY
 )
 
-llm = ChatOpenAI(
+openai_llm = ChatOpenAI(
     model_name=OPENAI_MODEL,
     max_tokens=800,
     temperature=0.2,
     api_key=OPENAI_API_KEY,
-    max_retries=5,     # tenta de novo em caso de 5xx
-    timeout=60         # evita travar
+    max_retries=5,
+    timeout=60,
 )
+
+cohere_llm = ChatCohere(
+    model=COHERE_MODEL,
+    cohere_api_key=COHERE_API_KEY,
+    max_tokens=800,
+    temperature=0.2,
+)
+
+def _select_llm_with_fallback():
+    if LLM_PRIMARY == "cohere":
+        return cohere_llm.with_fallbacks([openai_llm])
+    return openai_llm.with_fallbacks([cohere_llm])
 
 # -------------------------------------------------------------------
 # Prompts base
@@ -172,16 +191,25 @@ def _build_splitter() -> RecursiveCharacterTextSplitter:
     )
 
 def _combine_docs(docs) -> str:
-    """Transforma lista de Document em texto legível no prompt."""
+    """Transforma lista de Document em texto legível e curto para o prompt."""
     if not docs:
         return "NENHUM TRECHO ENCONTRADO."
-    parts = []
-    for i, d in enumerate(docs[:8]):  # limita contexto bruto no prompt
-        txt = (d.page_content or "").strip()
+    out = []
+    used = 0
+    for i, d in enumerate(docs[:MAX_DOCS_IN_PROMPT]):
+        txt = (getattr(d, "page_content", "") or "").strip()
         if not txt:
             continue
-        parts.append(f"Trecho {i+1}:\n{txt}")
-    return "\n\n".join(parts) if parts else "NENHUM TRECHO ENCONTRADO."
+        txt = " ".join(txt.split())  # compacta espaços
+        remaining = MAX_CONTEXT_CHARS - used
+        if remaining <= 0:
+            break
+        snippet = txt[:remaining]
+        out.append(f"Trecho {i+1}:\n{snippet}")
+        used += len(snippet)
+        if used >= MAX_CONTEXT_CHARS:
+            break
+    return "\n\n".join(out) if out else "NENHUM TRECHO ENCONTRADO."
 
 def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetriever:
     retriever = vectordb.as_retriever(search_kwargs={"k": RETRIEVER_K})
@@ -250,7 +278,8 @@ def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, promp
         "context": compressor_retriever | RunnableLambda(_combine_docs)
     })
     output_parser = StrOutputParser()
-    return setup_retrieval | prompt | llm | output_parser
+    llm_chain = _select_llm_with_fallback()
+    return setup_retrieval | prompt | llm_chain | output_parser
 
 # -------------------------------------------------------------------
 # Funcionalidades
