@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import os, sys, logging, shutil, tempfile, requests
-from typing import List, Optional, Tuple
+import os, sys, logging, shutil, tempfile, requests, time
+from typing import List, Optional, Tuple, Iterable
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 
 # -------------------------------------------------------------------
-# Variáveis de ambiente (NÃO hardcode chaves!)
+# Variáveis de ambiente
 # -------------------------------------------------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
@@ -38,13 +38,16 @@ if not OPENAI_API_KEY:
 if not COHERE_API_KEY:
     raise ValueError("Defina a variável de ambiente COHERE_API_KEY")
 
-# Configs ajustáveis por ambiente
-CHUNK_SIZE     = int(os.environ.get("CHUNK_SIZE", 1500))   # menor para reduzir tokens
-CHUNK_OVERLAP  = int(os.environ.get("CHUNK_OVERLAP", 100))
+# Configs (ajuste à vontade no /etc/orbyt-rag.env)
+CHUNK_SIZE     = int(os.environ.get("CHUNK_SIZE", 1200))   # menor → menos tokens
+CHUNK_OVERLAP  = int(os.environ.get("CHUNK_OVERLAP", 120))
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 VECTOR_DIR     = os.environ.get("VECTOR_DIR", "orbyt_vector_db")
 RETRIEVER_K    = int(os.environ.get("RETRIEVER_K", 8))
 RERANK_TOP_N   = int(os.environ.get("RERANK_TOP_N", 3))
+EMB_BATCH_SIZE = int(os.environ.get("EMB_BATCH_SIZE", 32))  # lotes pequenos p/ reduzir 520
+EMB_RETRIES    = int(os.environ.get("EMB_RETRIES", 6))
+EMB_SLEEP_BASE = float(os.environ.get("EMB_SLEEP_BASE", 0.8))  # backoff base
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
@@ -53,17 +56,18 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 # -------------------------------------------------------------------
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-3-small",
-    api_key=OPENAI_API_KEY
+    api_key=OPENAI_API_KEY,
+    timeout=60,       # importante para rede instável
+    max_retries=EMB_RETRIES
 )
 
-# timeout + retries ajudam quando a OpenAI devolve 520/instabilidades
 llm = ChatOpenAI(
     model_name=OPENAI_MODEL,
     max_tokens=800,
     temperature=0.2,
     api_key=OPENAI_API_KEY,
     timeout=60,
-    max_retries=3,  # tenta novamente em erro transitório
+    max_retries=3
 )
 
 # -------------------------------------------------------------------
@@ -81,7 +85,7 @@ Contexto:
 """
 
 FLASHCARDS_TEMPLATE = """
-Você é o Orby, um tutor de estudos. Gere flashcards concisos com base EXCLUSIVA no Contexto.
+Você é o Orby, um tutor de estudos. Gere flashcards concisos com base EXCLUSIVAMENTE no Contexto.
 Formato de saída (JSON válido): 
 [
   { "front": "pergunta ou termo", "back": "resposta objetiva" }
@@ -141,7 +145,7 @@ Contexto:
 """
 
 # -------------------------------------------------------------------
-# Utils coleção
+# Helpers
 # -------------------------------------------------------------------
 def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DIR) -> str:
     path = os.path.join(base_dir, f"user_{user_id}", f"collection_{collection_id}")
@@ -149,7 +153,6 @@ def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DI
     return path
 
 def _download_pdf(url: str) -> Tuple[str, bool]:
-    """Baixa URL para arquivo temporário e retorna (path, is_temp=True)."""
     fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     logging.info(f"Baixando PDF de {url}")
@@ -162,9 +165,6 @@ def _download_pdf(url: str) -> Tuple[str, bool]:
     return tmp_path, True
 
 def _materialize_pdf(src: str) -> Tuple[str, bool]:
-    """
-    Retorna (caminho_local, is_temp). Se for URL, baixa e marca is_temp=True.
-    """
     if src.lower().startswith("http"):
         return _download_pdf(src)
     return src, False
@@ -186,8 +186,12 @@ def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetrieve
     )
     return ContextualCompressionRetriever(base_compressor=rerank, base_retriever=retriever)
 
+def _batched(seq: List, size: int) -> Iterable[List]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
 # -------------------------------------------------------------------
-# Indexação
+# Indexação com lotes e backoff (mitiga 520)
 # -------------------------------------------------------------------
 def process_collection(user_id: str, collection_id: str, pdf_sources: List[str]) -> ContextualCompressionRetriever:
     coll_dir = _collection_path(user_id, collection_id, VECTOR_DIR)
@@ -196,8 +200,7 @@ def process_collection(user_id: str, collection_id: str, pdf_sources: List[str])
     total_pages = 0
 
     for src in pdf_sources:
-        local_pdf = None
-        is_temp = False
+        local_pdf, is_temp = None, False
         try:
             local_pdf, is_temp = _materialize_pdf(src)
             loader = PyPDFLoader(local_pdf, extract_images=False)
@@ -221,18 +224,41 @@ def process_collection(user_id: str, collection_id: str, pdf_sources: List[str])
     if not all_chunks:
         raise ValueError("Nenhum PDF válido para indexar.")
 
+    # cria ou reabre o índice
     if os.path.exists(coll_dir) and os.listdir(coll_dir):
         vectordb = Chroma(persist_directory=coll_dir, embedding_function=embeddings_model)
-        vectordb.add_documents(all_chunks)
-        logging.info(f"Coleção {collection_id} atualizada: +{len(all_chunks)} chunks (total páginas: {total_pages})")
     else:
+        # cria com o primeiro lote
+        first_batch = next(_batched(all_chunks, EMB_BATCH_SIZE))
         vectordb = Chroma.from_documents(
-            documents=all_chunks,
+            documents=first_batch,
             embedding=embeddings_model,
             persist_directory=coll_dir
         )
-        logging.info(f"Coleção {collection_id} criada: {len(all_chunks)} chunks (total páginas: {total_pages})")
+        remaining = all_chunks[len(first_batch):]
+        if not remaining:
+            logging.info(f"Coleção {collection_id} criada: {len(all_chunks)} chunks (total págs: {total_pages})")
+            return _build_reranked_retriever(vectordb)
+        all_chunks = remaining  # prossegue adicionando
 
+    # adiciona em lotes com pequenos backoffs
+    added = 0
+    for batch in _batched(all_chunks, EMB_BATCH_SIZE):
+        for attempt in range(EMB_RETRIES):
+            try:
+                vectordb.add_documents(batch)
+                added += len(batch)
+                break
+            except Exception as e:
+                wait = EMB_SLEEP_BASE * (2 ** attempt)
+                logging.warning(f"Embeddings 520/erro transitório (tentativa {attempt+1}/{EMB_RETRIES}). "
+                                f"Aguardando {wait:.1f}s. Detalhe: {e}")
+                time.sleep(wait)
+        else:
+            # todas as tentativas falharam
+            raise RuntimeError("Falha ao gerar embeddings (erros repetidos do provedor). Tente novamente em instantes.")
+
+    logging.info(f"Coleção {collection_id} atualizada/criada: +{added} chunks (total págs: {total_pages})")
     return _build_reranked_retriever(vectordb)
 
 def load_collection_retriever(user_id: str, collection_id: str) -> ContextualCompressionRetriever:
@@ -264,38 +290,22 @@ def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, promp
 # Funcionalidades
 # -------------------------------------------------------------------
 def ask_question(retriever: ContextualCompressionRetriever, question: str) -> str:
-    try:
-        chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
-        return chain.invoke(question)
-    except Exception as e:
-        logging.exception(f"Erro em ask_question: {e}")
-        raise
+    chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
+    return chain.invoke(question)
 
 def generate_flashcards(retriever: ContextualCompressionRetriever, objective: str, n_cards: int = 10) -> str:
-    try:
-        tmpl = FLASHCARDS_TEMPLATE.replace("{n_cards}", str(n_cards))
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_flashcards: {e}")
-        raise
+    tmpl = FLASHCARDS_TEMPLATE.replace("{n_cards}", str(n_cards))
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
 
 def generate_exercises(retriever: ContextualCompressionRetriever, objective: str, n_questions: int = 6, difficulty: str = "médio") -> str:
-    try:
-        tmpl = EXERCISES_TEMPLATE.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_exercises: {e}")
-        raise
+    tmpl = EXERCISES_TEMPLATE.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
 
 def generate_study_plan(retriever: ContextualCompressionRetriever, objective: str, days: int = 7, minutes_per_day: int = 60) -> str:
-    try:
-        tmpl = (STUDY_PLAN_TEMPLATE
-                .replace("{days}", str(days))
-                .replace("{minutes_per_day}", str(minutes_per_day)))
-        chain = create_rag_chain(retriever, prompt_template=tmpl)
-        return chain.invoke(objective)
-    except Exception as e:
-        logging.exception(f"Erro em generate_study_plan: {e}")
-        raise
+    tmpl = (STUDY_PLAN_TEMPLATE
+            .replace("{days}", str(days))
+            .replace("{minutes_per_day}", str(minutes_per_day)))
+    chain = create_rag_chain(retriever, prompt_template=tmpl)
+    return chain.invoke(objective)
