@@ -224,6 +224,95 @@ def process_collection(user_id: str, collection_id: str, pdf_sources: List[str])
     if not all_chunks:
         raise ValueError("Nenhum PDF válido para indexar.")
 
+    # -------------------------------------------------------------------
+    # Filtro e saneamento de chunks (evita 520 da OpenAI)
+    # -------------------------------------------------------------------
+    valid_chunks = []
+    for i, doc in enumerate(all_chunks, start=1):
+        txt = (doc.page_content or "").strip()
+        if not txt or len(txt) < 10:
+            logging.warning(f"[{collection_id}] Chunk #{i} descartado (vazio/curto)")
+            continue
+        if len(txt) > 7000:  # limite seguro p/ embeddings
+            logging.warning(f"[{collection_id}] Chunk #{i} muito grande ({len(txt)} chars), truncando...")
+            doc.page_content = txt[:7000]
+        valid_chunks.append(doc)
+
+    all_chunks = valid_chunks
+    if not all_chunks:
+        raise ValueError("Todos os chunks foram descartados (conteúdo inválido).")
+
+    # cria ou reabre o índice
+    if os.path.exists(coll_dir) and os.listdir(coll_dir):
+        vectordb = Chroma(persist_directory=coll_dir, embedding_function=embeddings_model)
+    else:
+        # cria com o primeiro lote
+        first_batch = next(_batched(all_chunks, EMB_BATCH_SIZE))
+        logging.info(f"[{collection_id}] Criando coleção com {len(first_batch)} chunks iniciais...")
+        vectordb = Chroma.from_documents(
+            documents=first_batch,
+            embedding=embeddings_model,
+            persist_directory=coll_dir
+        )
+        remaining = all_chunks[len(first_batch):]
+        if not remaining:
+            logging.info(f"Coleção {collection_id} criada: {len(all_chunks)} chunks (total págs: {total_pages})")
+            return _build_reranked_retriever(vectordb)
+        all_chunks = remaining  # prossegue adicionando
+
+    # adiciona em lotes com pequenos backoffs
+    added = 0
+    for batch_idx, batch in enumerate(_batched(all_chunks, EMB_BATCH_SIZE), start=1):
+        for attempt in range(EMB_RETRIES):
+            try:
+                logging.info(f"[{collection_id}] Enviando batch {batch_idx} com {len(batch)} chunks (tentativa {attempt+1})...")
+                vectordb.add_documents(batch)
+                added += len(batch)
+                break
+            except Exception as e:
+                wait = EMB_SLEEP_BASE * (2 ** attempt)
+                logging.warning(
+                    f"[{collection_id}] Erro embeddings (tentativa {attempt+1}/{EMB_RETRIES}). "
+                    f"Aguardando {wait:.1f}s. Detalhe: {e}"
+                )
+                time.sleep(wait)
+        else:
+            # todas as tentativas falharam
+            raise RuntimeError(f"[{collection_id}] Falha ao gerar embeddings (erros repetidos do provedor).")
+
+    logging.info(f"Coleção {collection_id} atualizada/criada: +{added} chunks (total págs: {total_pages})")
+    return _build_reranked_retriever(vectordb)
+
+    coll_dir = _collection_path(user_id, collection_id, VECTOR_DIR)
+    splitter = _build_splitter()
+    all_chunks = []
+    total_pages = 0
+
+    for src in pdf_sources:
+        local_pdf, is_temp = None, False
+        try:
+            local_pdf, is_temp = _materialize_pdf(src)
+            loader = PyPDFLoader(local_pdf, extract_images=False)
+            pages = loader.load_and_split()
+            if not pages:
+                logging.warning(f"[{collection_id}] PDF sem texto processável: {src}")
+                continue
+            total_pages += len(pages)
+            chunks = splitter.split_documents(pages)
+            all_chunks.extend(chunks)
+            logging.info(f"PDF {src} → {len(pages)} páginas, {len(chunks)} chunks")
+        except Exception as e:
+            logging.exception(f"Erro ao processar PDF {src}: {e}")
+        finally:
+            if is_temp and local_pdf and os.path.exists(local_pdf):
+                try:
+                    os.remove(local_pdf)
+                except Exception:
+                    pass
+
+    if not all_chunks:
+        raise ValueError("Nenhum PDF válido para indexar.")
+
     # cria ou reabre o índice
     if os.path.exists(coll_dir) and os.listdir(coll_dir):
         vectordb = Chroma(persist_directory=coll_dir, embedding_function=embeddings_model)
