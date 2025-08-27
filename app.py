@@ -4,7 +4,8 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from orbyt_rag import (
-    process_collection, load_collection_retriever, delete_collection,
+    EXERCISES_TEMPLATE_STRICT,  # 👈 importamos o template estrito
+    _normalize_exercises_payload, process_collection, load_collection_retriever, delete_collection,
     create_rag_chain, ask_question, generate_flashcards,
     generate_exercises, generate_study_plan
 )
@@ -14,17 +15,15 @@ from orbyt_rag import (
 # ---------------------------------------
 app = FastAPI(title="Orbyt RAG API", version="1.0.0")
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-retrievers_cache = {}  
+retrievers_cache = {}
 
 # ---------------------------------------
 # Schemas (Pydantic)
@@ -42,10 +41,11 @@ class FlashcardsPayload(BaseModel):
     prompt_template: Optional[str] = None
 
 class ExercisesPayload(BaseModel):
-    objective: str = Field(..., description="Tema/objetivo das questões")
+    objective: str = Field(..., description="Tema/objetivo das questões (ou RESUMO se usar contexto fixo)")
     n_questions: int = Field(6, ge=1, le=30)
     difficulty: str = Field("médio", description="fácil | médio | difícil")
     prompt_template: Optional[str] = None
+    use_objective_as_context: bool = False  # 👈 NOVO: usar apenas o 'objective' como CONTEXTO
 
 class StudyPlanPayload(BaseModel):
     objective: str = Field(..., description="Objetivo do aluno (ex.: prova tal)")
@@ -101,7 +101,6 @@ def flashcards(user_id: str, collection_id: str, payload: FlashcardsPayload):
         raise HTTPException(status_code=404, detail="Coleção não encontrada.")
 
     if payload.prompt_template:
-        # sobrepor prompt
         chain = create_rag_chain(retriever, prompt_template=payload.prompt_template)
         result = chain.invoke(payload.objective)
     else:
@@ -119,17 +118,23 @@ def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
     except Exception:
         raise HTTPException(status_code=404, detail="Coleção não encontrada.")
 
-    if payload.prompt_template:
-        chain = create_rag_chain(retriever, prompt_template=payload.prompt_template)
-        result = chain.invoke(payload.objective)
-    else:
-        result = generate_exercises(
-            retriever, payload.objective,
-            n_questions=payload.n_questions,
-            difficulty=payload.difficulty
-        )
+    # Sempre usamos o template ESTRITO (sem PII e somente JSON)
+    template_str = EXERCISES_TEMPLATE_STRICT \
+        .replace("{n_questions}", str(payload.n_questions)) \
+        .replace("{difficulty}", payload.difficulty)
 
-    return {"exercises": result}
+    if payload.use_objective_as_context:
+        # Usa SOMENTE o 'objective' como CONTEXTO fixo (ex.: RESUMO LIMPO vindo do app)
+        chain = create_rag_chain(None, prompt_template=template_str, fixed_context=payload.objective)
+        result = chain.invoke("Gerar exercícios a partir do resumo")
+    else:
+        # Usa o retriever (contexto já é higienizado em _combine_docs)
+        chain = create_rag_chain(retriever, prompt_template=template_str)
+        result = chain.invoke(payload.objective)
+
+    # Normaliza SEMPRE o formato:
+    normalized = _normalize_exercises_payload(result)
+    return {"exercises": normalized}
 
 # ---------------------------------------
 # Plano de estudos
