@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os, sys, logging, shutil, tempfile, requests
+import json, re  # ✅ ADICIONADO
 from typing import List, Optional
 
 # Desativa ruído de telemetria do Chroma
@@ -16,6 +17,7 @@ from langchain_core.runnables import RunnablePassthrough, RunnableParallel, Runn
 from langchain_core.output_parsers import StrOutputParser
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain_cohere import CohereRerank, CohereEmbeddings, ChatCohere
+from fastapi import HTTPException  # ✅ necessário no endpoint /exercises
 
 # -------------------------------------------------------------------
 # Encoding e logging
@@ -57,8 +59,6 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 
 # -------------------------------------------------------------------
 # Modelos
-#   - Embeddings em Cohere (estáveis)
-#   - LLM primário + fallback
 # -------------------------------------------------------------------
 embeddings_model = CohereEmbeddings(
     model="embed-multilingual-v3.0",
@@ -191,7 +191,6 @@ def _build_splitter() -> RecursiveCharacterTextSplitter:
     )
 
 def _combine_docs(docs) -> str:
-    """Transforma lista de Document em texto legível e curto para o prompt."""
     if not docs:
         return "NENHUM TRECHO ENCONTRADO."
     out = []
@@ -200,7 +199,7 @@ def _combine_docs(docs) -> str:
         txt = (getattr(d, "page_content", "") or "").strip()
         if not txt:
             continue
-        txt = " ".join(txt.split())  # compacta espaços
+        txt = " ".join(txt.split())
         remaining = MAX_CONTEXT_CHARS - used
         if remaining <= 0:
             break
@@ -219,6 +218,93 @@ def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetrieve
         cohere_api_key=COHERE_API_KEY
     )
     return ContextualCompressionRetriever(base_compressor=rerank, base_retriever=retriever)
+
+# -------------------------------------------------------------------
+# 🔧 Correções de normalização para EXERCÍCIOS
+# -------------------------------------------------------------------
+CODE_FENCE_RE = re.compile(r"```(?:json)?\s*|\s*```", re.I)
+
+def _strip_code_fences(s: str) -> str:
+    return CODE_FENCE_RE.sub("", s).strip()
+
+def _safe_json_loads(s: str):
+    s = _strip_code_fences(s)
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"(\{.*\}|\[.*\])", s, re.S)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                return {}
+        return {}
+
+def _normalize_exercises_payload(result):
+    """
+    Recebe `result` (string, dict ou list) e retorna:
+    { "questions": [ {question, options[], answer, explanation} ] }
+    """
+    # 1) Converte string em JSON
+    if isinstance(result, str):
+        obj = _safe_json_loads(result)
+    else:
+        obj = result
+
+    # 2) Caso venha aninhado como {"exercises": "..."} ou {"exercises": {...}}
+    if isinstance(obj, dict) and "exercises" in obj:
+        ex = obj["exercises"]
+        if isinstance(ex, str):
+            obj = _safe_json_loads(ex)
+        else:
+            obj = ex
+
+    # 3) Extrai lista de questões
+    questions_raw = []
+    if isinstance(obj, dict):
+        if "questions" in obj and isinstance(obj["questions"], list):
+            questions_raw = obj["questions"]
+        else:
+            # Pode vir como {"Q1": {...}, "Q2": {...}}
+            questions_raw = list(obj.values())
+    elif isinstance(obj, list):
+        questions_raw = obj
+
+    # 4) Normaliza cada item
+    norm = []
+    for it in questions_raw or []:
+        if not isinstance(it, dict):
+            continue
+
+        q_text = (it.get("question") or "").strip()
+
+        # options pode ser list/str/dict
+        opts = it.get("options", [])
+        if isinstance(opts, dict):
+            ordered = [opts.get(k) for k in ["A", "B", "C", "D"] if opts.get(k)]
+            opts = ordered
+        elif isinstance(opts, str):
+            parts = [p.strip() for p in re.split(r"[\n;]", opts) if p.strip()]
+            opts = parts
+        elif isinstance(opts, list):
+            opts = [str(o) for o in opts]
+        else:
+            opts = []
+
+        ans = it.get("answer")
+        if isinstance(ans, str):
+            m = re.match(r"\s*([ABCD])", ans.strip(), re.I)
+            if m:
+                ans = m.group(1).upper()
+
+        norm.append({
+            "question": q_text if q_text else "Pergunta não encontrada",
+            "options": opts,
+            "answer": ans,  # "A"/"B"/"C"/"D" (o App converte p/ índice)
+            "explanation": (it.get("explanation") or "").strip()
+        })
+
+    return {"questions": norm}
 
 # -------------------------------------------------------------------
 # Indexação
@@ -304,3 +390,4 @@ def generate_study_plan(retriever: ContextualCompressionRetriever, objective: st
             .replace("{minutes_per_day}", str(minutes_per_day)))
     chain = create_rag_chain(retriever, prompt_template=tmpl)
     return chain.invoke(objective)
+
