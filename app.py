@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from orbyt_rag import (
-    process_collection, load_collection_retriever, delete_collection,
+    _normalize_exercises_payload, process_collection, load_collection_retriever, delete_collection,
     create_rag_chain, ask_question, generate_flashcards,
     generate_exercises, generate_study_plan
 )
@@ -129,7 +129,9 @@ def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
             difficulty=payload.difficulty
         )
 
-    return {"exercises": result}
+    # ✅ Normaliza SEMPRE o formato:
+    normalized = _normalize_exercises_payload(result)
+    return {"exercises": normalized}
 
 # ---------------------------------------
 # Plano de estudos
