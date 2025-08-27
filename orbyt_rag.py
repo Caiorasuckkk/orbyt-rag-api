@@ -2,7 +2,7 @@
 # coding: utf-8
 
 import os, sys, logging, shutil, tempfile, requests
-import json, re  # ✅ ADICIONADO
+import json, re
 from typing import List, Optional
 
 # Desativa ruído de telemetria do Chroma
@@ -17,7 +17,7 @@ from langchain_core.runnables import RunnablePassthrough, RunnableParallel, Runn
 from langchain_core.output_parsers import StrOutputParser
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain_cohere import CohereRerank, CohereEmbeddings, ChatCohere
-from fastapi import HTTPException  # ✅ necessário no endpoint /exercises
+from fastapi import HTTPException  # (usado por endpoints no app.py)
 
 # -------------------------------------------------------------------
 # Encoding e logging
@@ -117,6 +117,7 @@ Contexto:
 {context}
 """
 
+# Template original (mantido para compatibilidade)
 EXERCISES_TEMPLATE = """
 Você é o Orby. Crie {n_questions} questões de múltipla escolha, baseadas EXCLUSIVAMENTE no Contexto.
 Nível: {difficulty}. Inclua gabarito e explicação breve.
@@ -134,6 +135,35 @@ Formato (JSON válido):
 }}
 
 Contexto:
+{context}
+"""
+
+# Template estrito — reforça proibição de PII e saída só-JSON
+EXERCISES_TEMPLATE_STRICT = """
+Responda ESTRITAMENTE em português do Brasil (pt-BR).
+
+REGRAS (OBRIGATÓRIO):
+- NUNCA inclua nomes de pessoas, e-mails, telefones, nomes de instituições, turmas, códigos de disciplina, URLs, datas específicas ou metadados.
+- Se tais itens aparecerem no CONTEXTO, TRATE-OS como “[removido]” ou termos genéricos como “o autor”, “a instituição”.
+- Foque apenas no conteúdo pedagógico.
+
+TAREFA:
+Gere {n_questions} questões de múltipla escolha com base EXCLUSIVA no CONTEXTO abaixo (já higienizado).
+Nível: {difficulty}. Inclua gabarito e explicação breve.
+
+SAÍDA (apenas JSON VÁLIDO, sem texto fora do JSON):
+{{
+  "questions": [
+    {{
+      "question": "enunciado",
+      "options": ["A) ...","B) ...","C) ...","D) ..."],
+      "answer": "A",
+      "explanation": "breve justificativa"
+    }}
+  ]
+}}
+
+CONTEXTO:
 {context}
 """
 
@@ -162,66 +192,19 @@ Contexto:
 """
 
 # -------------------------------------------------------------------
-# Helpers
+# Helpers de PII + JSON
 # -------------------------------------------------------------------
-def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DIR) -> str:
-    path = os.path.join(base_dir, f"user_{user_id}", f"collection_{collection_id}")
-    os.makedirs(path, exist_ok=True)
-    return path
+def scrub_pii(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', '[removido]', text)     # e-mail
+    text = re.sub(r'https?:\/\/\S+', '[removido]', text)                 # URL
+    text = re.sub(r'\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{4,5}[\s-]?\d{4}\b', '[removido]', text) # tel
+    text = re.sub(r'\b\d{3}\.\d{3}\.\d{3}-\d{2}\b', '[removido]', text)  # CPF
+    text = re.sub(r'\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b', '[removido]', text) # CNPJ
+    text = re.sub(r'\b(Professor(?:a)?|Prof\.?|Universidade|Instituto|Faculdade)\b.*', '[removido]', text, flags=re.IGNORECASE)
+    return text
 
-def _materialize_pdf(src: str) -> str:
-    if src.lower().startswith("http"):
-        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
-        logging.info(f"Baixando PDF de {src}")
-        with requests.get(src, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(8192):
-                    f.write(chunk)
-        return tmp_path
-    return src
-
-def _build_splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        length_function=len,
-        add_start_index=True
-    )
-
-def _combine_docs(docs) -> str:
-    if not docs:
-        return "NENHUM TRECHO ENCONTRADO."
-    out = []
-    used = 0
-    for i, d in enumerate(docs[:MAX_DOCS_IN_PROMPT]):
-        txt = (getattr(d, "page_content", "") or "").strip()
-        if not txt:
-            continue
-        txt = " ".join(txt.split())
-        remaining = MAX_CONTEXT_CHARS - used
-        if remaining <= 0:
-            break
-        snippet = txt[:remaining]
-        out.append(f"Trecho {i+1}:\n{snippet}")
-        used += len(snippet)
-        if used >= MAX_CONTEXT_CHARS:
-            break
-    return "\n\n".join(out) if out else "NENHUM TRECHO ENCONTRADO."
-
-def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetriever:
-    retriever = vectordb.as_retriever(search_kwargs={"k": RETRIEVER_K})
-    rerank = CohereRerank(
-        model="rerank-multilingual-v3.0",
-        top_n=RERANK_TOP_N,
-        cohere_api_key=COHERE_API_KEY
-    )
-    return ContextualCompressionRetriever(base_compressor=rerank, base_retriever=retriever)
-
-# -------------------------------------------------------------------
-# 🔧 Correções de normalização para EXERCÍCIOS
-# -------------------------------------------------------------------
 CODE_FENCE_RE = re.compile(r"```(?:json)?\s*|\s*```", re.I)
 
 def _strip_code_fences(s: str) -> str:
@@ -309,6 +292,62 @@ def _normalize_exercises_payload(result):
 # -------------------------------------------------------------------
 # Indexação
 # -------------------------------------------------------------------
+def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DIR) -> str:
+    path = os.path.join(base_dir, f"user_{user_id}", f"collection_{collection_id}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _materialize_pdf(src: str) -> str:
+    if src.lower().startswith("http"):
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        logging.info(f"Baixando PDF de {src}")
+        with requests.get(src, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+        return tmp_path
+    return src
+
+def _build_splitter() -> RecursiveCharacterTextSplitter:
+    return RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        add_start_index=True
+    )
+
+def _combine_docs(docs) -> str:
+    if not docs:
+        return "NENHUM TRECHO ENCONTRADO."
+    out = []
+    used = 0
+    for i, d in enumerate(docs[:MAX_DOCS_IN_PROMPT]):
+        txt = (getattr(d, "page_content", "") or "").strip()
+        if not txt:
+            continue
+        txt = " ".join(txt.split())
+        txt = scrub_pii(txt)  # 👈 higieniza PII
+        remaining = MAX_CONTEXT_CHARS - used
+        if remaining <= 0:
+            break
+        snippet = txt[:remaining]
+        out.append(f"Trecho {i+1}:\n{snippet}")
+        used += len(snippet)
+        if used >= MAX_CONTEXT_CHARS:
+            break
+    return "\n\n".join(out) if out else "NENHUM TRECHO ENCONTRADO."
+
+def _build_reranked_retriever(vectordb: Chroma) -> ContextualCompressionRetriever:
+    retriever = vectordb.as_retriever(search_kwargs={"k": RETRIEVER_K})
+    rerank = CohereRerank(
+        model="rerank-multilingual-v3.0",
+        top_n=RERANK_TOP_N,
+        cohere_api_key=COHERE_API_KEY
+    )
+    return ContextualCompressionRetriever(base_compressor=rerank, base_retriever=retriever)
+
 def process_collection(user_id: str, collection_id: str, pdf_sources: List[str]) -> ContextualCompressionRetriever:
     coll_dir = _collection_path(user_id, collection_id, VECTOR_DIR)
     splitter = _build_splitter()
@@ -353,18 +392,29 @@ def delete_collection(user_id: str, collection_id: str) -> None:
         logging.info(f"Coleção {collection_id} deletada")
 
 # -------------------------------------------------------------------
-# Chain RAG
+# Chain RAG (agora aceita fixed_context)
 # -------------------------------------------------------------------
-def create_rag_chain(compressor_retriever: ContextualCompressionRetriever, prompt_template: Optional[str] = None):
+def create_rag_chain(
+    compressor_retriever: Optional[ContextualCompressionRetriever] = None,
+    prompt_template: Optional[str] = None,
+    fixed_context: Optional[str] = None
+):
     template = prompt_template or TUTOR_TEMPLATE
     prompt = ChatPromptTemplate.from_template(template)
+    output_parser = StrOutputParser()
+    llm_chain = _select_llm_with_fallback()
+
+    if fixed_context is not None:
+        setup = RunnableParallel({
+            "question": RunnablePassthrough(),
+            "context": RunnableLambda(lambda _: scrub_pii(fixed_context)),
+        })
+        return setup | prompt | llm_chain | output_parser
 
     setup_retrieval = RunnableParallel({
         "question": RunnablePassthrough(),
         "context": compressor_retriever | RunnableLambda(_combine_docs)
     })
-    output_parser = StrOutputParser()
-    llm_chain = _select_llm_with_fallback()
     return setup_retrieval | prompt | llm_chain | output_parser
 
 # -------------------------------------------------------------------
@@ -380,7 +430,7 @@ def generate_flashcards(retriever: ContextualCompressionRetriever, objective: st
     return chain.invoke(objective)
 
 def generate_exercises(retriever: ContextualCompressionRetriever, objective: str, n_questions: int = 6, difficulty: str = "médio") -> str:
-    tmpl = EXERCISES_TEMPLATE.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
+    tmpl = EXERCISES_TEMPLATE_STRICT.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
     chain = create_rag_chain(retriever, prompt_template=tmpl)
     return chain.invoke(objective)
 
@@ -390,4 +440,3 @@ def generate_study_plan(retriever: ContextualCompressionRetriever, objective: st
             .replace("{minutes_per_day}", str(minutes_per_day)))
     chain = create_rag_chain(retriever, prompt_template=tmpl)
     return chain.invoke(objective)
-
