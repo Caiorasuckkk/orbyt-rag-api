@@ -175,27 +175,47 @@ Contexto:
 """
 
 # Template estrito p/ PERGUNTAS ORAIS (sem PII e somente JSON)
+# Template estrito p/ PERGUNTAS ORAIS (sem PII, só JSON e ESPECÍFICAS AO CONTEÚDO)
 ORAL_QUESTIONS_TEMPLATE_STRICT = """
-Responda ESTRITAMENTE em português do Brasil (pt-BR).
+Responda ESTRITAMENTE em português do Brasil (pt-BR) e ESTRITAMENTE em JSON VÁLIDO (sem texto fora do JSON).
 
 REGRAS (OBRIGATÓRIO):
 - NUNCA inclua nomes de pessoas, e-mails, telefones, nomes de instituições, turmas, códigos de disciplina, URLs, datas específicas ou metadados.
 - Se tais itens aparecerem no CONTEXTO, TRATE-OS como “[removido]” ou termos genéricos como “o autor”, “a instituição”.
 - Foque apenas no conteúdo pedagógico.
 
+ESPECIFICIDADE (OBRIGATÓRIO):
+- Cada "prompt" DEVE citar pelo menos 1 termo/conceito/entidade que APARECE no contexto (ex.: “fotossíntese”, “Revolução de 1930”, “lei dos gases ideais”).
+- É PROIBIDO usar prompts genéricos como: "Quais os temas abordados?", "Fale sobre o conteúdo/tema/material/texto", "Faça um resumo".
+- Varie os focos: definição, relação causal, comparação, aplicação prática, exceções/armadilhas.
+
 TAREFA:
 Gere {n_questions} perguntas ABERTAS de chamada oral com base EXCLUSIVA no CONTEXTO abaixo (já higienizado).
 Para cada pergunta inclua:
-- "prompt": enunciado curto, específico ao contexto;
+- "prompt": enunciado curto e específico ao contexto (citando termos do contexto);
 - "modelAnswer": 1–3 frases objetivas baseadas no contexto;
-- "keywords": até 5 termos/frases-chave do contexto ligadas à pergunta.
+- "keywords": 3–5 termos/frases-chave presentes no contexto e relacionados à pergunta.
 
-SAÍDA (apenas JSON VÁLIDO, sem texto fora do JSON):
+SAÍDA (apenas JSON VÁLIDO):
 [
   {{
-    "prompt": "...",
+    "prompt": "Explique o papel de <termo_do_contexto> em <processo/evento_do_contexto>.",
+    "modelAnswer": "Resposta objetiva baseada no contexto, 1–3 frases.",
+    "keywords": ["<termo_do_contexto>", "<conceito_relacionado>", "<processo>"]
+  }}
+]
+
+NÃO FAÇA (exemplos proibidos):
+[
+  {{
+    "prompt": "Quais os temas abordados no conteúdo?",
     "modelAnswer": "...",
-    "keywords": ["...", "..."]
+    "keywords": ["conteúdo", "tema"]
+  }},
+  {{
+    "prompt": "Fale sobre o material estudado.",
+    "modelAnswer": "...",
+    "keywords": ["material"]
   }}
 ]
 
@@ -205,6 +225,7 @@ Pedido:
 CONTEXTO:
 {context}
 """
+
 
 # -------------------------------------------------------------------
 # Helpers de PII + JSON
