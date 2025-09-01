@@ -1,13 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from orbyt_rag import (
-    EXERCISES_TEMPLATE_STRICT,  # 👈 importamos o template estrito
-    _normalize_exercises_payload, process_collection, load_collection_retriever, delete_collection,
-    create_rag_chain, ask_question, generate_flashcards,
-    generate_exercises, generate_study_plan
+    EXERCISES_TEMPLATE_STRICT,
+    _normalize_exercises_payload, _normalize_oral_payload,
+    process_collection, load_collection_retriever, delete_collection,
+    create_rag_chain, ask_question,
+    generate_exercises, generate_study_plan, generate_oral_questions
 )
 
 # ---------------------------------------
@@ -23,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-retrievers_cache = {}
+retrievers_cache: Dict[tuple, Any] = {}
 
 # ---------------------------------------
 # Schemas (Pydantic)
@@ -35,23 +36,23 @@ class AskPayload(BaseModel):
     question: str = Field(..., description="Pergunta do usuário")
     prompt_template: Optional[str] = Field(None, description="Opcional: prompt customizado")
 
-class FlashcardsPayload(BaseModel):
-    objective: str = Field(..., description="Tópico/objetivo para gerar cards")
-    n_cards: int = Field(10, ge=1, le=50, description="Quantidade aproximada de cards")
-    prompt_template: Optional[str] = None
-
 class ExercisesPayload(BaseModel):
     objective: str = Field(..., description="Tema/objetivo das questões (ou RESUMO se usar contexto fixo)")
     n_questions: int = Field(6, ge=1, le=30)
     difficulty: str = Field("médio", description="fácil | médio | difícil")
     prompt_template: Optional[str] = None
-    use_objective_as_context: bool = False  # 👈 NOVO: usar apenas o 'objective' como CONTEXTO
+    use_objective_as_context: bool = False  # usar somente 'objective' como CONTEXTO (ex.: resumo já higienizado)
 
 class StudyPlanPayload(BaseModel):
     objective: str = Field(..., description="Objetivo do aluno (ex.: prova tal)")
     days: int = Field(7, ge=1, le=60)
     minutes_per_day: int = Field(60, ge=15, le=480)
     prompt_template: Optional[str] = None
+
+class OralQuestionsPayload(BaseModel):
+    summary: str = Field(..., description="Resumo LIMPO (PII scrub) vindo do app")
+    count: int = Field(10, ge=1, le=30, description="Quantidade de perguntas")
+    use_summary_as_context: bool = Field(True, description="Se True, usa somente o summary como contexto fixo")
 
 # ---------------------------------------
 # Health-check
@@ -91,25 +92,7 @@ def ask(user_id: str, collection_id: str, payload: AskPayload):
     return {"answer": answer}
 
 # ---------------------------------------
-# Flashcards
-# ---------------------------------------
-@app.post("/collections/{user_id}/{collection_id}/flashcards")
-def flashcards(user_id: str, collection_id: str, payload: FlashcardsPayload):
-    try:
-        retriever = retrievers_cache.get((user_id, collection_id)) or load_collection_retriever(user_id, collection_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Coleção não encontrada.")
-
-    if payload.prompt_template:
-        chain = create_rag_chain(retriever, prompt_template=payload.prompt_template)
-        result = chain.invoke(payload.objective)
-    else:
-        result = generate_flashcards(retriever, payload.objective, n_cards=payload.n_cards)
-
-    return {"flashcards": result}
-
-# ---------------------------------------
-# Exercícios
+# Exercícios (MCQ)
 # ---------------------------------------
 @app.post("/collections/{user_id}/{collection_id}/exercises")
 def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
@@ -156,6 +139,61 @@ def study_plan(user_id: str, collection_id: str, payload: StudyPlanPayload):
         )
 
     return {"study_plan": result}
+
+# ---------------------------------------
+# Perguntas orais (oficial)
+# ---------------------------------------
+@app.post("/collections/{user_id}/{collection_id}/oral-questions")
+def oral_questions(user_id: str, collection_id: str, payload: OralQuestionsPayload):
+    retriever = None
+    if not payload.use_summary_as_context:
+        try:
+            retriever = retrievers_cache.get((user_id, collection_id)) or load_collection_retriever(user_id, collection_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Coleção não encontrada.")
+
+    result = generate_oral_questions(
+        retriever,
+        payload.summary,
+        n_questions=payload.count,
+        use_objective_as_context=payload.use_summary_as_context
+    )
+    items = _normalize_oral_payload(result)
+    return {"items": items}
+
+# ---------------------------------------
+# Perguntas orais (compatibilidade com cliente antigo)
+# ---------------------------------------
+@app.post("/oral_questions")
+def oral_questions_root(payload: dict):
+    try:
+        user_id = str(payload.get("userId") or payload.get("user_id") or "")
+        collection_id = str(payload.get("collectionId") or payload.get("collection_id") or "")
+        summary = str(payload.get("summary") or "")
+        count = int(payload.get("count") or 10)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload inválido")
+
+    if not summary:
+        raise HTTPException(status_code=400, detail="summary obrigatório")
+
+    use_summary_as_context = bool(payload.get("use_summary_as_context", True))
+    retriever = None
+    if not use_summary_as_context:
+        try:
+            retriever = retrievers_cache.get((user_id, collection_id)) or load_collection_retriever(user_id, collection_id)
+        except Exception:
+            retriever = None
+            use_summary_as_context = True
+
+    result = generate_oral_questions(
+        retriever,
+        summary,
+        n_questions=count,
+        use_objective_as_context=use_summary_as_context
+    )
+    items = _normalize_oral_payload(result)
+    return items  # aqui retornamos a lista diretamente
 
 # ---------------------------------------
 # Encerrar estudos (apagar coleção)

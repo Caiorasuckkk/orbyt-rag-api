@@ -100,24 +100,7 @@ Contexto:
 {context}
 """
 
-FLASHCARDS_TEMPLATE = """
-Você é o Orby, um tutor de estudos. Gere flashcards concisos com base EXCLUSIVA no Contexto.
-Formato de saída (JSON válido): 
-[
-  {{ "front": "pergunta ou termo", "back": "resposta objetiva" }},
-  ...
-]
-
-Quantidade aproximada: {n_cards} cards.
-
-Tópico/Objetivo do aluno:
-{question}
-
-Contexto:
-{context}
-"""
-
-# Template original (mantido para compatibilidade)
+# Template original (mantido para compatibilidade de exercises)
 EXERCISES_TEMPLATE = """
 Você é o Orby. Crie {n_questions} questões de múltipla escolha, baseadas EXCLUSIVAMENTE no Contexto.
 Nível: {difficulty}. Inclua gabarito e explicação breve.
@@ -188,6 +171,31 @@ Objetivo do aluno:
 {question}
 
 Contexto:
+{context}
+"""
+
+# Template estrito p/ PERGUNTAS ORAIS (sem PII e somente JSON)
+ORAL_QUESTIONS_TEMPLATE_STRICT = """
+Responda ESTRITAMENTE em português do Brasil (pt-BR).
+
+REGRAS (OBRIGATÓRIO):
+- NUNCA inclua nomes de pessoas, e-mails, telefones, nomes de instituições, turmas, códigos de disciplina, URLs, datas específicas ou metadados.
+- Se tais itens aparecerem no CONTEXTO, TRATE-OS como “[removido]” ou termos genéricos como “o autor”, “a instituição”.
+- Foque apenas no conteúdo pedagógico.
+
+TAREFA:
+Gere {n_questions} perguntas ABERTAS de chamada oral com base EXCLUSIVA no CONTEXTO abaixo (já higienizado).
+Para cada pergunta inclua:
+- "prompt": enunciado curto, específico ao contexto;
+- "modelAnswer": 1–3 frases objetivas baseadas no contexto;
+- "keywords": até 5 termos/frases-chave do contexto ligadas à pergunta.
+
+SAÍDA (apenas JSON VÁLIDO, sem texto fora do JSON):
+[
+  { "prompt": "…", "modelAnswer": "…", "keywords": ["…","…"] }
+]
+
+CONTEXTO:
 {context}
 """
 
@@ -288,6 +296,57 @@ def _normalize_exercises_payload(result):
         })
 
     return {"questions": norm}
+
+def _to_list_str(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    if isinstance(v, str):
+        parts = re.split(r"[,;\n]", v)
+        return [p.strip() for p in parts if p.strip()]
+    return [str(v)]
+
+def _normalize_oral_payload(result):
+    """
+    Recebe `result` (string/dict/list) e retorna uma LISTA de objetos:
+    [{ "prompt": str, "modelAnswer": str, "keywords": [str,...] }]
+    """
+    # 1) Converte string em JSON
+    if isinstance(result, str):
+        obj = _safe_json_loads(result)
+    else:
+        obj = result
+
+    items = []
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict):
+        # pode vir {"items":[...]} ou outro wrapper
+        if isinstance(obj.get("items"), list):
+            items = obj["items"]
+        else:
+            vals = list(obj.values())
+            if vals and isinstance(vals[0], list):
+                items = vals[0]
+            else:
+                items = vals
+
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        prompt = str(it.get("prompt") or it.get("question") or "").strip()
+        model = str(it.get("modelAnswer") or it.get("model_answer") or it.get("answer") or "").strip()
+        kws = _to_list_str(it.get("keywords"))[:5]
+        if not prompt:
+            continue
+        out.append({
+            "prompt": prompt,
+            "modelAnswer": model,
+            "keywords": kws
+        })
+    return out
 
 # -------------------------------------------------------------------
 # Indexação
@@ -424,11 +483,6 @@ def ask_question(retriever: ContextualCompressionRetriever, question: str) -> st
     chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
     return chain.invoke(question)
 
-def generate_flashcards(retriever: ContextualCompressionRetriever, objective: str, n_cards: int = 10) -> str:
-    tmpl = FLASHCARDS_TEMPLATE.replace("{n_cards}", str(n_cards))
-    chain = create_rag_chain(retriever, prompt_template=tmpl)
-    return chain.invoke(objective)
-
 def generate_exercises(retriever: ContextualCompressionRetriever, objective: str, n_questions: int = 6, difficulty: str = "médio") -> str:
     tmpl = EXERCISES_TEMPLATE_STRICT.replace("{n_questions}", str(n_questions)).replace("{difficulty}", difficulty)
     chain = create_rag_chain(retriever, prompt_template=tmpl)
@@ -440,3 +494,22 @@ def generate_study_plan(retriever: ContextualCompressionRetriever, objective: st
             .replace("{minutes_per_day}", str(minutes_per_day)))
     chain = create_rag_chain(retriever, prompt_template=tmpl)
     return chain.invoke(objective)
+
+def generate_oral_questions(
+    retriever: Optional[ContextualCompressionRetriever],
+    objective_or_summary: str,
+    n_questions: int = 10,
+    use_objective_as_context: bool = True
+) -> str:
+    """
+    Gera perguntas orais. Se use_objective_as_context=True,
+    usa SOMENTE o texto passado (ex.: RESUMO vindo do app) como contexto fixo.
+    Caso contrário, usa o retriever (RAG).
+    """
+    tmpl = ORAL_QUESTIONS_TEMPLATE_STRICT.replace("{n_questions}", str(n_questions))
+    if use_objective_as_context:
+        chain = create_rag_chain(None, prompt_template=tmpl, fixed_context=objective_or_summary)
+        return chain.invoke("Gerar perguntas orais a partir do resumo")
+    else:
+        chain = create_rag_chain(retriever, prompt_template=tmpl)
+        return chain.invoke(objective_or_summary)
