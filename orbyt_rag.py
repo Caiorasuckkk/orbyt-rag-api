@@ -192,8 +192,15 @@ Para cada pergunta inclua:
 
 SAÍDA (apenas JSON VÁLIDO, sem texto fora do JSON):
 [
-  { "prompt": "…", "modelAnswer": "…", "keywords": ["…","…"] }
+  {{
+    "prompt": "...",
+    "modelAnswer": "...",
+    "keywords": ["...", "..."]
+  }}
 ]
+
+Pedido:
+{question}
 
 CONTEXTO:
 {context}
