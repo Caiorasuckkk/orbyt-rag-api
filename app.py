@@ -41,8 +41,7 @@ class ExercisesPayload(BaseModel):
     n_questions: int = Field(6, ge=1, le=30)
     difficulty: str = Field("médio", description="fácil | médio | difícil")
     prompt_template: Optional[str] = None
-    use_objective_as_context: bool = False  # usar somente 'objective' como CONTEXTO (ex.: resumo já higienizado)
-
+    use_objective_as_context: bool = False  
 class StudyPlanPayload(BaseModel):
     objective: str = Field(..., description="Objetivo do aluno (ex.: prova tal)")
     days: int = Field(7, ge=1, le=60)
@@ -101,13 +100,13 @@ def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
     except Exception:
         raise HTTPException(status_code=404, detail="Coleção não encontrada.")
 
-    # Sempre usamos o template ESTRITO (sem PII e somente JSON)
+   
     template_str = EXERCISES_TEMPLATE_STRICT \
         .replace("{n_questions}", str(payload.n_questions)) \
         .replace("{difficulty}", payload.difficulty)
 
     if payload.use_objective_as_context:
-        # Usa SOMENTE o 'objective' como CONTEXTO fixo (ex.: RESUMO LIMPO vindo do app)
+       
         chain = create_rag_chain(None, prompt_template=template_str, fixed_context=payload.objective)
         result = chain.invoke("Gerar exercícios a partir do resumo")
     else:
@@ -115,7 +114,7 @@ def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
         chain = create_rag_chain(retriever, prompt_template=template_str)
         result = chain.invoke(payload.objective)
 
-    # Normaliza SEMPRE o formato:
+    
     normalized = _normalize_exercises_payload(result)
     return {"exercises": normalized}
 
