@@ -11,9 +11,7 @@ from orbyt_rag import (
     generate_exercises, generate_study_plan, generate_oral_questions
 )
 
-# ---------------------------------------
-# Configuração do FastAPI + CORS
-# ---------------------------------------
+
 app = FastAPI(title="Orbyt RAG API", version="1.0.0")
 
 app.add_middleware(
@@ -26,9 +24,7 @@ app.add_middleware(
 
 retrievers_cache: Dict[tuple, Any] = {}
 
-# ---------------------------------------
-# Schemas (Pydantic)
-# ---------------------------------------
+
 class IndexPayload(BaseModel):
     pdf_urls: List[str] = Field(..., description="URLs dos PDFs (Firebase/S3 presigned, etc.)")
 
@@ -53,9 +49,7 @@ class OralQuestionsPayload(BaseModel):
     count: int = Field(10, ge=1, le=30, description="Quantidade de perguntas")
     use_summary_as_context: bool = Field(True, description="Se True, usa somente o summary como contexto fixo")
 
-# ---------------------------------------
-# Health-check
-# ---------------------------------------
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -72,9 +66,7 @@ def index_collection(user_id: str, collection_id: str, payload: IndexPayload):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------------------------------------
-# Tutor (chat RAG)
-# ---------------------------------------
+
 @app.post("/collections/{user_id}/{collection_id}/ask")
 def ask(user_id: str, collection_id: str, payload: AskPayload):
     try:
@@ -90,9 +82,7 @@ def ask(user_id: str, collection_id: str, payload: AskPayload):
 
     return {"answer": answer}
 
-# ---------------------------------------
-# Exercícios (MCQ)
-# ---------------------------------------
+
 @app.post("/collections/{user_id}/{collection_id}/exercises")
 def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
     try:
@@ -118,9 +108,7 @@ def exercises(user_id: str, collection_id: str, payload: ExercisesPayload):
     normalized = _normalize_exercises_payload(result)
     return {"exercises": normalized}
 
-# ---------------------------------------
-# Plano de estudos
-# ---------------------------------------
+
 @app.post("/collections/{user_id}/{collection_id}/study-plan")
 def study_plan(user_id: str, collection_id: str, payload: StudyPlanPayload):
     try:
@@ -139,9 +127,7 @@ def study_plan(user_id: str, collection_id: str, payload: StudyPlanPayload):
 
     return {"study_plan": result}
 
-# ---------------------------------------
-# Perguntas orais (oficial)
-# ---------------------------------------
+
 @app.post("/collections/{user_id}/{collection_id}/oral-questions")
 def oral_questions(user_id: str, collection_id: str, payload: OralQuestionsPayload):
     retriever = None
@@ -160,9 +146,6 @@ def oral_questions(user_id: str, collection_id: str, payload: OralQuestionsPaylo
     items = _normalize_oral_payload(result)
     return {"items": items}
 
-# ---------------------------------------
-# Perguntas orais (compatibilidade com cliente antigo)
-# ---------------------------------------
 @app.post("/oral_questions")
 def oral_questions_root(payload: dict):
     try:
@@ -194,9 +177,7 @@ def oral_questions_root(payload: dict):
     items = _normalize_oral_payload(result)
     return items  # aqui retornamos a lista diretamente
 
-# ---------------------------------------
-# Encerrar estudos (apagar coleção)
-# ---------------------------------------
+
 @app.delete("/collections/{user_id}/{collection_id}")
 def delete(user_id: str, collection_id: str):
     delete_collection(user_id, collection_id)
