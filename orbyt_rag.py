@@ -19,9 +19,6 @@ from langchain.retrievers.contextual_compression import ContextualCompressionRet
 from langchain_cohere import CohereRerank, CohereEmbeddings, ChatCohere
 from fastapi import HTTPException  # (usado por endpoints no app.py)
 
-# -------------------------------------------------------------------
-# Encoding e logging
-# -------------------------------------------------------------------
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except Exception:
@@ -29,9 +26,7 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# -------------------------------------------------------------------
-# Variáveis de ambiente
-# -------------------------------------------------------------------
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
 
@@ -57,9 +52,7 @@ COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-r")
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-# -------------------------------------------------------------------
-# Modelos
-# -------------------------------------------------------------------
+
 embeddings_model = CohereEmbeddings(
     model="embed-multilingual-v3.0",
     cohere_api_key=COHERE_API_KEY
@@ -86,9 +79,7 @@ def _select_llm_with_fallback():
         return cohere_llm.with_fallbacks([openai_llm])
     return openai_llm.with_fallbacks([cohere_llm])
 
-# -------------------------------------------------------------------
-# Prompts base
-# -------------------------------------------------------------------
+
 TUTOR_TEMPLATE = """
 Você é o Orby, um assistente de estudos que responde com base no material enviado pelo usuário.
 Responda sempre em português, de forma clara e objetiva.
@@ -226,9 +217,7 @@ CONTEXTO:
 """
 
 
-# -------------------------------------------------------------------
-# Helpers de PII + JSON
-# -------------------------------------------------------------------
+
 def scrub_pii(text: str) -> str:
     if not text:
         return text
@@ -375,9 +364,6 @@ def _normalize_oral_payload(result):
         })
     return out
 
-# -------------------------------------------------------------------
-# Indexação
-# -------------------------------------------------------------------
 def _collection_path(user_id: str, collection_id: str, base_dir: str = VECTOR_DIR) -> str:
     path = os.path.join(base_dir, f"user_{user_id}", f"collection_{collection_id}")
     os.makedirs(path, exist_ok=True)
@@ -477,9 +463,6 @@ def delete_collection(user_id: str, collection_id: str) -> None:
         shutil.rmtree(coll_dir)
         logging.info(f"Coleção {collection_id} deletada")
 
-# -------------------------------------------------------------------
-# Chain RAG (agora aceita fixed_context)
-# -------------------------------------------------------------------
 def create_rag_chain(
     compressor_retriever: Optional[ContextualCompressionRetriever] = None,
     prompt_template: Optional[str] = None,
@@ -503,9 +486,7 @@ def create_rag_chain(
     })
     return setup_retrieval | prompt | llm_chain | output_parser
 
-# -------------------------------------------------------------------
-# Funcionalidades
-# -------------------------------------------------------------------
+
 def ask_question(retriever: ContextualCompressionRetriever, question: str) -> str:
     chain = create_rag_chain(retriever, prompt_template=TUTOR_TEMPLATE)
     return chain.invoke(question)
