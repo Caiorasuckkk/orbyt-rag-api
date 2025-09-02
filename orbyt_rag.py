@@ -5,7 +5,7 @@ import os, sys, logging, shutil, tempfile, requests
 import json, re
 from typing import List, Optional
 
-# Desativa ruído de telemetria do Chroma
+
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -100,7 +100,7 @@ Contexto:
 {context}
 """
 
-# Template original (mantido para compatibilidade de exercises)
+
 EXERCISES_TEMPLATE = """
 Você é o Orby. Crie {n_questions} questões de múltipla escolha, baseadas EXCLUSIVAMENTE no Contexto.
 Nível: {difficulty}. Inclua gabarito e explicação breve.
@@ -121,7 +121,7 @@ Contexto:
 {context}
 """
 
-# Template estrito — reforça proibição de PII e saída só-JSON
+
 EXERCISES_TEMPLATE_STRICT = """
 Responda ESTRITAMENTE em português do Brasil (pt-BR).
 
@@ -174,8 +174,7 @@ Contexto:
 {context}
 """
 
-# Template estrito p/ PERGUNTAS ORAIS (sem PII e somente JSON)
-# Template estrito p/ PERGUNTAS ORAIS (sem PII, só JSON e ESPECÍFICAS AO CONTEÚDO)
+
 ORAL_QUESTIONS_TEMPLATE_STRICT = """
 Responda ESTRITAMENTE em português do Brasil (pt-BR) e ESTRITAMENTE em JSON VÁLIDO (sem texto fora do JSON).
 
@@ -278,7 +277,7 @@ def _normalize_exercises_payload(result):
         else:
             obj = ex
 
-    # 3) Extrai lista de questões
+   
     questions_raw = []
     if isinstance(obj, dict):
         if "questions" in obj and isinstance(obj["questions"], list):
